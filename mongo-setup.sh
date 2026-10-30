@@ -15,7 +15,8 @@
 #   ./mongo-setup.sh                         # asks for every value
 #   ./mongo-setup.sh -m 8.0 -d myapp -u myapp_user
 #
-# Run as a normal user WITH sudo rights (NOT as root).
+# Run as root or as a normal user with sudo rights. The credentials file is
+# saved in that user's home folder.
 
 set -euo pipefail
 
@@ -50,6 +51,27 @@ ask() {
 
 # need OPTION VALUE - fail clearly when a flag is missing its value.
 need() { [[ -n "${2:-}" && "$2" != -* ]] || c_die "Option $1 needs a value (see --help)."; }
+
+# A fresh server often runs automatic updates at first boot and holds the apt
+# lock for a few minutes; wait for it instead of failing.
+apt_wait() {
+  local i
+  command -v fuser >/dev/null 2>&1 || return 0
+  for i in $(seq 1 60); do
+    sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 || return 0
+    if (( i == 1 )); then c_warn "Another apt process is running (often automatic updates on a fresh server) - waiting..."; fi
+    sleep 5
+  done
+  c_die "apt is still locked after 5 minutes - check: ps aux | grep -E 'apt|dpkg'"
+}
+
+# apt_get ARGS - non-interactive apt-get that waits for the apt lock.
+# sudo resets the environment, so the variables are passed per call.
+apt_get() {
+  apt_wait
+  sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+    apt-get -o DPkg::Lock::Timeout=300 "$@"
+}
 
 # 32 random letters/digits - safe inside a connection string without escaping.
 gen_pw() {
@@ -108,8 +130,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ------------------------------------------------------------ sanity check ---
-[[ $EUID -eq 0 ]] && c_die "Do not run as root/sudo. Run as your normal user; the script calls sudo where needed."
-command -v sudo >/dev/null 2>&1 || c_die "sudo is not installed."
+# Works as root or as a normal user with sudo. As root, `sudo` just runs the
+# command (minimal images may not even have sudo installed).
+if (( EUID == 0 )); then
+  sudo() { if [[ "${1:-}" == "-v" ]]; then return 0; fi; "$@"; }
+else
+  command -v sudo >/dev/null 2>&1 || c_die "sudo is not installed."
+fi
+RUN_USER="$(id -un)"
 [[ -f /etc/os-release ]] || c_die "Cannot detect the OS (/etc/os-release missing)."
 OS_ID="$(. /etc/os-release && echo "${ID:-}")"
 CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
@@ -172,14 +200,14 @@ sudo -v || c_die "sudo authentication failed."
 # ------------------------------------------------------------- 1. install ---
 if [[ -z "$INSTALLED_VERSION" ]]; then
   c_info "1/4  Installing MongoDB $MONGO_VERSION"
-  sudo env DEBIAN_FRONTEND=noninteractive apt-get update -y
-  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y gnupg curl openssl
+  apt_get update -y
+  apt_get install -y gnupg curl openssl
   curl -fsSL "https://www.mongodb.org/static/pgp/server-$MONGO_VERSION.asc" \
     | sudo gpg --dearmor --yes -o "/usr/share/keyrings/mongodb-server-$MONGO_VERSION.gpg"
   echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-$MONGO_VERSION.gpg ] https://repo.mongodb.org/apt/ubuntu $CODENAME/mongodb-org/$MONGO_VERSION multiverse" \
     | sudo tee "/etc/apt/sources.list.d/mongodb-org-$MONGO_VERSION.list" >/dev/null
-  sudo env DEBIAN_FRONTEND=noninteractive apt-get update -y
-  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y mongodb-org
+  apt_get update -y
+  apt_get install -y mongodb-org
   INSTALLED_VERSION="$(dpkg-query -W -f='${Version}' mongodb-org)"
   c_ok "MongoDB $INSTALLED_VERSION installed"
 else
@@ -311,7 +339,7 @@ cat <<DONE
 
   All credentials : $CRED_FILE  (chmod 600)
   Admin shell     : mongosh "\$(grep ^ADMIN_URI= $CRED_FILE | cut -d= -f2-)"
-  From your PC    : ssh -L 27017:127.0.0.1:27017 $USER@<server-ip>
+  From your PC    : ssh -L 27017:127.0.0.1:27017 $RUN_USER@<server-ip>
                     then connect Compass to mongodb://localhost:27017 with the URI above
   Another app     : rerun ./mongo-setup.sh with a new database name
 ============================================================

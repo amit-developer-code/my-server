@@ -22,7 +22,8 @@
 #   ./deploy.sh --list            show releases
 #   ./deploy.sh --dir /srv/app    base folder, if it cannot be auto-detected
 #
-# Run on the server as the same normal user that ran server-setup.sh.
+# Run on the server as the same user that ran server-setup.sh (root or a
+# normal user) - that user owns deploy.conf and has nvm/Node installed.
 
 set -euo pipefail
 
@@ -132,7 +133,7 @@ set_conf() {
   rm -f "$tmp"
 }
 
-[[ $EUID -eq 0 ]] && c_die "Do not run as root/sudo. Run as the user that ran server-setup.sh."
+RUN_USER="$(id -un)"
 
 if [[ -z "$BASE" ]]; then
   if [[ -f "./deploy.conf" ]]; then
@@ -150,6 +151,10 @@ fi
 BASE="${BASE%/}"
 CONF="$BASE/deploy.conf"
 [[ -f "$CONF" ]] || c_die "$CONF not found - run server-setup.sh first (or pass --dir)."
+# nvm/Node and pm2 live under the user that ran server-setup.sh (the owner of deploy.conf).
+CONF_OWNER="$(stat -c %U "$CONF")"
+[[ "$CONF_OWNER" == "$RUN_USER" ]] \
+  || c_die "$CONF belongs to '$CONF_OWNER' (the user that ran server-setup.sh) - run this script as '$CONF_OWNER', not '$RUN_USER'."
 load_conf
 
 [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || c_die "deploy.conf: DOMAIN '$DOMAIN' is not a valid domain."
@@ -207,10 +212,19 @@ ensure_pm2() {
     npm install -g pm2
   fi
   c_ok "pm2 $(pm2 -v)"
-  if ! systemctl is-enabled "pm2-$USER" >/dev/null 2>&1; then
+  if ! systemctl is-enabled "pm2-$RUN_USER" >/dev/null 2>&1; then
     # Register the systemd hook so pm2 restores saved apps on reboot.
     local startup_cmd
-    startup_cmd="$(pm2 startup systemd -u "$USER" --hp "$HOME" | grep -E "^sudo " || true)"
+    if (( EUID == 0 )); then
+      # As root, pm2 installs the hook itself instead of printing a sudo command.
+      if pm2 startup systemd -u "$RUN_USER" --hp "$HOME" >/dev/null; then
+        c_ok "pm2 boot hook registered"
+      else
+        c_warn "Could not register pm2 boot hook - run 'pm2 startup' and follow its output"
+      fi
+      return 0
+    fi
+    startup_cmd="$(pm2 startup systemd -u "$RUN_USER" --hp "$HOME" | grep -E "^sudo " || true)"
     if [[ -n "$startup_cmd" ]]; then
       eval "$startup_cmd"
       c_ok "pm2 boot hook registered"

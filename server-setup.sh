@@ -18,15 +18,17 @@
 # Any value not given as a flag is asked for; press Enter to keep the
 # default shown in [brackets].
 #
-# Run as a normal user WITH sudo rights (NOT as root - nvm must be
-# installed under your own user account).
+# Run as root or as a normal user with sudo rights. nvm/Node are installed
+# under that user, so run the deploy scripts as the same user.
 
 set -euo pipefail
 
 DEFAULT_PORT="8080"
 DEFAULT_NODE_VERSION="v24.13.0"
 DEFAULT_BRANCH="main"
+DEFAULT_REDIRECT_URL="https://www.loopbitstudio.com/"
 NVM_VERSION="v0.40.3"
+CATCH_ALL="/etc/nginx/sites-available/000-catch-all"
 
 # Empty = not given as a flag, so the user is asked for it.
 DOMAIN=""
@@ -36,6 +38,7 @@ EMAIL=""
 NODE_VERSION=""
 REPO_URL=""
 BRANCH=""
+REDIRECT_URL=""
 SKIP_SSL="false"
 
 # ---------------------------------------------------------------- helpers ---
@@ -59,6 +62,27 @@ ask() {
 # need OPTION VALUE - fail clearly when a flag is missing its value.
 need() { [[ -n "${2:-}" && "$2" != -* ]] || c_die "Option $1 needs a value (see --help)."; }
 
+# A fresh server often runs automatic updates at first boot and holds the apt
+# lock for a few minutes; wait for it instead of failing.
+apt_wait() {
+  local i
+  command -v fuser >/dev/null 2>&1 || return 0
+  for i in $(seq 1 60); do
+    sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 || return 0
+    if (( i == 1 )); then c_warn "Another apt process is running (often automatic updates on a fresh server) - waiting..."; fi
+    sleep 5
+  done
+  c_die "apt is still locked after 5 minutes - check: ps aux | grep -E 'apt|dpkg'"
+}
+
+# apt_get ARGS - non-interactive apt-get that waits for the apt lock.
+# sudo resets the environment, so the variables are passed per call.
+apt_get() {
+  apt_wait
+  sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+    apt-get -o DPkg::Lock::Timeout=300 "$@"
+}
+
 usage() {
   cat <<USAGE
 Usage: $0 [options]
@@ -69,6 +93,8 @@ Usage: $0 [options]
   -v, --node      VERSION    node version (default: $DEFAULT_NODE_VERSION)
   -r, --repo      URL        Git repo HTTPS URL (saved to deploy.conf)
   -b, --branch    BRANCH     Git branch to deploy (default: $DEFAULT_BRANCH)
+      --redirect  URL        where requests by IP / unknown domains go, first run only
+                             (default: $DEFAULT_REDIRECT_URL)
       --skip-ssl             do not run certbot
   -h, --help                 show this help
 Anything not passed is asked for interactively.
@@ -84,6 +110,7 @@ while [[ $# -gt 0 ]]; do
     -v|--node)    need "$1" "${2:-}"; NODE_VERSION="$2"; shift 2 ;;
     -r|--repo)    need "$1" "${2:-}"; REPO_URL="$2";     shift 2 ;;
     -b|--branch)  need "$1" "${2:-}"; BRANCH="$2";       shift 2 ;;
+    --redirect)   need "$1" "${2:-}"; REDIRECT_URL="$2"; shift 2 ;;
     --skip-ssl)   SKIP_SSL="true";       shift   ;;
     -h|--help)    usage; exit 0 ;;
     *) c_die "Unknown option: $1" ;;
@@ -91,8 +118,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ------------------------------------------------------------ sanity check ---
-[[ $EUID -eq 0 ]] && c_die "Do not run as root/sudo. Run as your normal user; the script calls sudo where needed."
-command -v sudo >/dev/null 2>&1 || c_die "sudo is not installed."
+# Works as root or as a normal user with sudo. As root, `sudo` just runs the
+# command (minimal images may not even have sudo installed).
+if (( EUID == 0 )); then
+  sudo() { if [[ "${1:-}" == "-v" ]]; then return 0; fi; "$@"; }
+else
+  command -v sudo >/dev/null 2>&1 || c_die "sudo is not installed."
+fi
+RUN_USER="$(id -un)"
+RUN_GROUP="$(id -gn 2>/dev/null || id -g)"
 [[ -f /etc/debian_version ]] || c_warn "Not a Debian/Ubuntu system - apt steps may fail."
 
 ask DOMAIN "Domain (e.g. example.com)"
@@ -129,6 +163,15 @@ fi
 ask BRANCH "Git branch to deploy" "$DEFAULT_BRANCH"
 [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || c_die "'$BRANCH' is not a valid branch name."
 
+# The catch-all is server-wide: only asked for (and created) on the first run.
+if [[ -f "$CATCH_ALL" ]]; then
+  REDIRECT_LABEL="already set up ($CATCH_ALL) - left untouched"
+else
+  ask REDIRECT_URL "Redirect requests by IP / unknown domains to" "$DEFAULT_REDIRECT_URL"
+  [[ "$REDIRECT_URL" =~ ^https?://[^[:space:]\;\'\"\$]+$ ]] || c_die "Redirect must be a full http(s):// URL without spaces, quotes, ; or \$ (got '$REDIRECT_URL')."
+  REDIRECT_LABEL="$REDIRECT_URL"
+fi
+
 # Add www. only for a root domain (exactly one dot, e.g. example.com).
 if [[ "$DOMAIN" =~ ^[^.]+\.[^.]+$ ]]; then
   DOMAINS=("$DOMAIN" "www.$DOMAIN")
@@ -161,6 +204,8 @@ cat <<SUMMARY
   App port    : $PORT
   Node        : $NODE_VERSION (via nvm $NVM_VERSION)
   Repo        : ${REPO_URL:-(asked at first deploy)} ($BRANCH)
+  Unknown/IP  : $REDIRECT_LABEL
+  Run as      : $RUN_USER
   SSL         : $SSL_LABEL
 ------------------------------------------------------------
 SUMMARY
@@ -176,9 +221,8 @@ sudo -v || c_die "sudo authentication failed."
 
 # ------------------------------------------------------- 1. system packages ---
 c_info "1/6  Updating packages and installing nginx"
-# sudo resets the environment, so DEBIAN_FRONTEND must be passed per call.
-sudo env DEBIAN_FRONTEND=noninteractive apt-get update -y
-sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y nginx curl ca-certificates git
+apt_get update -y
+apt_get install -y nginx curl ca-certificates git
 c_ok "nginx + git installed"
 
 # ----------------------------------------------------------------- 2. ufw ---
@@ -202,7 +246,7 @@ fi
 c_info "3/6  Creating base folder, deploy.conf and fallback page"
 # The deploy script creates release-<version> folders and the current symlink here.
 sudo mkdir -p "$APP_DIR"
-sudo chown "$USER":"$USER" "$APP_DIR"
+sudo chown "$RUN_USER":"$RUN_GROUP" "$APP_DIR"
 sudo chmod 755 "$APP_DIR"
 
 CONF="$APP_DIR/deploy.conf"
@@ -235,6 +279,28 @@ c_ok "base folder $APP_DIR and fallback page ready"
 
 # --------------------------------------------------------- 4. nginx vhost ---
 c_info "4/6  Writing nginx server block"
+
+# Requests by IP or for domains not set up here: redirect instead of showing
+# the "Welcome to nginx!" page. Replaces nginx's default site (first run only).
+# Only one site may be the default; if another (not nginx's own) already is, leave it.
+OTHER_DEFAULT="$(grep -lE 'listen[^;]*default_server' /etc/nginx/sites-enabled/* 2>/dev/null | grep -v '/default$' || true)"
+if [[ ! -f "$CATCH_ALL" && -n "$OTHER_DEFAULT" ]]; then
+  c_warn "Not adding the catch-all redirect: $OTHER_DEFAULT already handles unknown domains / IP."
+elif [[ ! -f "$CATCH_ALL" ]]; then
+  sudo rm -f /etc/nginx/sites-enabled/default
+  sudo tee "$CATCH_ALL" >/dev/null <<NGINX
+# Written by server-setup.sh: requests by IP or for unknown domains.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 302 $REDIRECT_URL;
+}
+NGINX
+  sudo ln -sfn "$CATCH_ALL" "/etc/nginx/sites-enabled/000-catch-all"
+  c_ok "nginx default site disabled; unknown domains / IP -> $REDIRECT_URL"
+fi
+
 VHOST="/etc/nginx/sites-available/$DOMAIN"
 if [[ -f "$VHOST" ]]; then
   # Never overwrite: it may already hold certbot's HTTPS settings.
@@ -280,10 +346,12 @@ NGINX
   fi
 fi
 
-sudo nginx -t || c_die "nginx config test failed - review $VHOST"
-sudo systemctl reload nginx
+sudo nginx -t || c_die "nginx config test failed - review $VHOST and $CATCH_ALL (only one site may use default_server)"
 sudo systemctl enable nginx >/dev/null 2>&1 || true
-c_ok "nginx reloaded and enabled at boot"
+# Starts nginx if it is not running yet (reload alone fails then).
+sudo systemctl reload-or-restart nginx \
+  || c_die "nginx did not start - check: sudo journalctl -u nginx -n 50 (is another web server using port 80?)"
+c_ok "nginx running and enabled at boot"
 
 # ---------------------------------------------------------- 5. nvm + node ---
 c_info "5/6  Installing nvm + Node $NODE_VERSION"
@@ -313,7 +381,7 @@ if [[ "$SKIP_SSL" == "true" ]]; then
   c_warn "Run later: sudo certbot --nginx ${CERTBOT_DOMAINS[*]}"
 else
   c_info "6/6  Issuing SSL certificate with certbot"
-  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y certbot python3-certbot-nginx
+  apt_get install -y certbot python3-certbot-nginx
   if sudo certbot --nginx --non-interactive --agree-tos \
         -m "$EMAIL" --redirect "${CERTBOT_DOMAINS[@]}"; then
     SCHEME="https"
