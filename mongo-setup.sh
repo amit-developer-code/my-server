@@ -133,7 +133,7 @@ done
 # Works as root or as a normal user with sudo. As root, `sudo` just runs the
 # command (minimal images may not even have sudo installed).
 if (( EUID == 0 )); then
-  sudo() { if [[ "${1:-}" == "-v" ]]; then return 0; fi; "$@"; }
+  sudo() { while [[ "${1:-}" == -* ]]; do shift; done; if (( $# )); then "$@"; fi; }
 else
   command -v sudo >/dev/null 2>&1 || c_die "sudo is not installed."
 fi
@@ -195,7 +195,11 @@ case "$CONFIRM" in
   *) echo "Aborted."; exit 0 ;;
 esac
 
-sudo -v || c_die "sudo authentication failed."
+# Skipped when sudo needs no password (e.g. the default user on AWS/cloud
+# images) - some sudo versions still ask for one on `sudo -v` in that case.
+if ! sudo -n true 2>/dev/null; then
+  sudo -v || c_die "sudo authentication failed."
+fi
 
 # ------------------------------------------------------------- 1. install ---
 if [[ -z "$INSTALLED_VERSION" ]]; then
