@@ -35,6 +35,8 @@ DEFAULT_BRANCH="main"
 DEFAULT_REDIRECT_URL="https://www.loopbitstudio.com/"
 NVM_VERSION="v0.40.3"
 CATCH_ALL="/etc/nginx/sites-available/000-catch-all"
+SWAP_FILE="/swapfile"
+SWAP_MB="2048"           # created only if the server has no swap at all
 
 # Empty = not given as a flag, so the user is asked for it.
 DOMAIN=""
@@ -231,13 +233,39 @@ if ! sudo -n true 2>/dev/null; then
 fi
 
 # ------------------------------------------------------- 1. system packages ---
-c_info "1/6  Updating packages and installing nginx"
+c_info "1/7  Updating packages and installing nginx"
 apt_get update -y
 apt_get install -y nginx curl ca-certificates git
 c_ok "nginx + git installed"
 
-# ----------------------------------------------------------------- 2. ufw ---
-c_info "2/6  Configuring firewall (ufw)"
+# ---------------------------------------------------------------- 2. swap ---
+# Small servers (e.g. 1-2 GB AWS instances) have no swap, and npm install /
+# builds then get killed for lack of memory. Add a swap file only if there is
+# no swap at all; existing swap is left alone.
+c_info "2/7  Checking swap"
+if [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then
+  c_ok "swap already present - leaving it alone"
+elif [[ -e "$SWAP_FILE" ]]; then
+  c_warn "$SWAP_FILE exists but is not active - not touching it (enable with: sudo swapon $SWAP_FILE)"
+else
+  FREE_MB="$(df --output=avail -m / | tail -n 1 | tr -d ' ')"
+  if (( FREE_MB < SWAP_MB + 1024 )); then
+    c_warn "Only ${FREE_MB} MB free disk - not creating ${SWAP_MB} MB swap (needs 1 GB spare). npm install may run out of memory."
+  else
+    sudo fallocate -l "${SWAP_MB}M" "$SWAP_FILE" \
+      || sudo dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$SWAP_MB" status=none
+    sudo chmod 600 "$SWAP_FILE"
+    sudo mkswap "$SWAP_FILE" >/dev/null
+    sudo swapon "$SWAP_FILE" || c_die "Could not enable swap on $SWAP_FILE - check: sudo swapon $SWAP_FILE"
+    # Keep it after reboot.
+    grep -qE "^$SWAP_FILE[[:space:]]" /etc/fstab \
+      || echo "$SWAP_FILE none swap sw 0 0" | sudo tee -a /etc/fstab >/dev/null
+    c_ok "created ${SWAP_MB} MB swap at $SWAP_FILE (kept after reboot)"
+  fi
+fi
+
+# ----------------------------------------------------------------- 3. ufw ---
+c_info "3/7  Configuring firewall (ufw)"
 if command -v ufw >/dev/null 2>&1; then
   if sudo ufw allow OpenSSH; then
     sudo ufw allow 'Nginx Full' || c_warn "Could not add Nginx Full rule"
@@ -253,8 +281,8 @@ else
   c_warn "ufw not present - skipping firewall step"
 fi
 
-# -------------------------------------------------------------- 3. folders ---
-c_info "3/6  Creating base folder, deploy.conf and fallback page"
+# -------------------------------------------------------------- 4. folders ---
+c_info "4/7  Creating base folder, deploy.conf and fallback page"
 # The deploy script creates release-<version> folders and the current symlink here.
 sudo mkdir -p "$APP_DIR"
 sudo chown "$RUN_USER":"$RUN_GROUP" "$APP_DIR"
@@ -283,8 +311,8 @@ sudo mkdir -p "$FALLBACK_DIR"
 sudo install -m 644 "$PAGE_SRC" "$FALLBACK_DIR/maintenance.html"
 c_ok "base folder $APP_DIR and fallback page ready"
 
-# --------------------------------------------------------- 4. nginx vhost ---
-c_info "4/6  Writing nginx server block"
+# --------------------------------------------------------- 5. nginx vhost ---
+c_info "5/7  Writing nginx server block"
 
 # Requests by IP or for domains not set up here: redirect instead of showing
 # the "Welcome to nginx!" page. Replaces nginx's default site (first run only).
@@ -360,8 +388,8 @@ sudo systemctl reload-or-restart nginx \
   || c_die "nginx did not start - check: sudo journalctl -u nginx -n 50 (is another web server using port 80?)"
 c_ok "nginx running and enabled at boot"
 
-# ---------------------------------------------------------- 5. nvm + node ---
-c_info "5/6  Installing nvm + Node $NODE_VERSION"
+# ---------------------------------------------------------- 6. nvm + node ---
+c_info "6/7  Installing nvm + Node $NODE_VERSION"
 export NVM_DIR="$HOME/.nvm"
 if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
   curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/$NVM_VERSION/install.sh" | bash
@@ -381,13 +409,13 @@ nvm use default >/dev/null
 set -u
 c_ok "node $(node -v) / npm $(npm -v)"
 
-# ------------------------------------------------------------------ 6. ssl ---
+# ------------------------------------------------------------------ 7. ssl ---
 SCHEME="http"
 if [[ "$SKIP_SSL" == "true" ]]; then
-  c_info "6/6  SSL skipped"
+  c_info "7/7  SSL skipped"
   c_warn "Run later: sudo certbot --nginx ${CERTBOT_DOMAINS[*]}"
 else
-  c_info "6/6  Issuing SSL certificate with certbot"
+  c_info "7/7  Issuing SSL certificate with certbot"
   apt_get install -y certbot python3-certbot-nginx
   if sudo certbot --nginx --non-interactive --agree-tos \
         -m "$EMAIL" --redirect "${CERTBOT_DOMAINS[@]}"; then
