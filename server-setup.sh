@@ -20,8 +20,14 @@
 #
 # Run as root or as a normal user with sudo rights. nvm/Node are installed
 # under that user, so run the deploy scripts as the same user.
+#
+# Needs maintenance.html next to this script: it is copied (on every run) to
+# /var/www/DOMAIN-static/ and shown while the app is down.
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PAGE_SRC="$SCRIPT_DIR/maintenance.html"
 
 DEFAULT_PORT="8080"
 DEFAULT_NODE_VERSION="v24.13.0"
@@ -128,6 +134,7 @@ fi
 RUN_USER="$(id -un)"
 RUN_GROUP="$(id -gn 2>/dev/null || id -g)"
 [[ -f /etc/debian_version ]] || c_warn "Not a Debian/Ubuntu system - apt steps may fail."
+[[ -f "$PAGE_SRC" ]] || c_die "maintenance.html not found next to server-setup.sh ($PAGE_SRC) - copy it there and rerun."
 
 ask DOMAIN "Domain (e.g. example.com)"
 [[ -z "$DOMAIN" ]] && c_die "Domain is required."
@@ -200,7 +207,7 @@ cat <<SUMMARY
 ------------------------------------------------------------
   Domain(s)   : ${DOMAINS[*]}
   Base dir    : $APP_DIR (deploy.conf + release folders)
-  Fallback    : $FALLBACK_DIR (shown when the app is down)
+  Fallback    : $FALLBACK_DIR/maintenance.html (copy of $PAGE_SRC)
   App port    : $PORT
   Node        : $NODE_VERSION (via nvm $NVM_VERSION)
   Repo        : ${REPO_URL:-(asked at first deploy)} ($BRANCH)
@@ -272,13 +279,8 @@ EOF_CONF
 fi
 
 sudo mkdir -p "$FALLBACK_DIR"
-if [[ ! -e "$FALLBACK_DIR/maintenance.html" ]]; then
-  sudo tee "$FALLBACK_DIR/maintenance.html" >/dev/null <<HTML
-<!doctype html>
-<html><head><meta charset="utf-8"><title>$DOMAIN</title></head>
-<body><h1>$DOMAIN is temporarily unavailable</h1><p>Please try again in a few minutes.</p></body></html>
-HTML
-fi
+# Copied on every run, so editing maintenance.html and rerunning updates it.
+sudo install -m 644 "$PAGE_SRC" "$FALLBACK_DIR/maintenance.html"
 c_ok "base folder $APP_DIR and fallback page ready"
 
 # --------------------------------------------------------- 4. nginx vhost ---
@@ -320,8 +322,9 @@ server {
 
     client_max_body_size 20M;
 
-    # Shown when the app is not running / not reachable.
-    error_page 502 503 504 /maintenance.html;
+    # Shown when the app is not running / not reachable. Sent as 503 so
+    # proxies like Cloudflare pass this page through instead of their own.
+    error_page 502 503 504 =503 /maintenance.html;
     location = /maintenance.html {
         root $FALLBACK_DIR;
         internal;
