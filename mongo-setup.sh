@@ -13,15 +13,18 @@
 #
 # Usage:
 #   ./mongo-setup.sh                         # asks for every value
-#   ./mongo-setup.sh -m 8.0 -d myapp -u myapp_user
+#   ./mongo-setup.sh -m 9.0 -d myapp -u myapp_user
+#
+# The version defaults to the newest one MongoDB publishes for this server's
+# Ubuntu release and CPU; check your app's driver/Mongoose supports it.
 #
 # Run as root or as a normal user with sudo rights. The credentials file is
 # saved in that user's home folder.
 
 set -euo pipefail
 
-DEFAULT_MONGO_VERSION="8.0"
 DEFAULT_ADMIN_USER="admin"
+MONGO_REPO="https://repo.mongodb.org/apt/ubuntu/dists"
 CRED_FILE="$HOME/mongo-credentials.txt"
 MONGOD_CONF="/etc/mongod.conf"
 LOCAL_URI="mongodb://127.0.0.1:27017/admin"
@@ -103,6 +106,36 @@ wait_for_mongo() {
   c_die "MongoDB did not start within 30s - check: sudo journalctl -u mongod -n 50"
 }
 
+# has_server_pkg VERSION - true if MongoDB's repo has the mongodb-org server
+# package for this Ubuntu release + CPU. A repo folder can exist without it
+# (e.g. 8.0 on Ubuntu 26.04 only has the tools), so look for the package itself.
+has_server_pkg() {
+  local list
+  list="$(curl -fsS "$MONGO_REPO/$CODENAME/mongodb-org/$1/multiverse/binary-$DEB_ARCH/Packages" 2>/dev/null || true)"
+  grep -q '^Package: mongodb-org$' <<<"$list"
+}
+
+# newest_version - newest MongoDB version with a server package here.
+# The repo has no version index, so probe 6.0-12.5 in parallel.
+newest_version() {
+  local tmp v major minor
+  tmp="$(mktemp -d)"
+  for major in $(seq 6 12); do
+    for minor in $(seq 0 5); do
+      v="$major.$minor"
+      ( curl -fsS -o /dev/null "$MONGO_REPO/$CODENAME/mongodb-org/$v/Release" 2>/dev/null && : > "$tmp/$v" ) &
+    done
+  done
+  wait
+  for v in $(ls "$tmp" | sort -t. -k1,1nr -k2,2nr); do
+    if has_server_pkg "$v"; then
+      printf '%s' "$v"
+      break
+    fi
+  done
+  rm -rf -- "$tmp"
+}
+
 cred_get() {  # KEY - read a value from the credentials file
   [[ -f "$CRED_FILE" ]] || return 0
   grep -E "^$1=" "$CRED_FILE" | tail -n 1 | cut -d= -f2- || true
@@ -111,7 +144,8 @@ cred_get() {  # KEY - read a value from the credentials file
 usage() {
   cat <<USAGE
 Usage: $0 [options]
-  -m, --mongo-version VER   MongoDB version for a new install (default: $DEFAULT_MONGO_VERSION)
+  -m, --mongo-version VER   MongoDB version for a new install
+                            (default: newest published for this Ubuntu release)
   -d, --db NAME             database for the app user
   -u, --user NAME           app user name (default: NAME_user)
   -h, --help                show this help
@@ -150,19 +184,40 @@ if [[ -f "$MONGOD_CONF" ]] && grep -qE '^[[:space:]]+authorization:[[:space:]]*e
 fi
 
 if [[ -z "$INSTALLED_VERSION" ]]; then
-  ask MONGO_VERSION "MongoDB version" "$DEFAULT_MONGO_VERSION"
-  [[ "$MONGO_VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || c_die "'$MONGO_VERSION' is not a version like 8.0."
+  case "$(uname -m)" in
+    x86_64)        DEB_ARCH="amd64" ;;
+    aarch64|arm64) DEB_ARCH="arm64" ;;
+    *) c_die "MongoDB publishes packages only for x86_64 and arm64 (this server: $(uname -m))." ;;
+  esac
 
   # MongoDB 5.0+ needs AVX on x86_64; without it mongod crashes on start.
-  if [[ "$(uname -m)" == "x86_64" ]] && ! grep -qw avx /proc/cpuinfo; then
+  if [[ "$DEB_ARCH" == "amd64" ]] && ! grep -qw avx /proc/cpuinfo; then
     c_die "This CPU has no AVX support, which MongoDB 5.0+ requires on x86_64. Use a server/VPS plan with AVX."
   fi
 
-  # Check MongoDB publishes this version for this Ubuntu release before changing anything.
   command -v curl >/dev/null 2>&1 || c_die "curl is not installed (run server-setup.sh first, or: sudo apt-get install -y curl)."
-  REPO_RELEASE="https://repo.mongodb.org/apt/ubuntu/dists/$CODENAME/mongodb-org/$MONGO_VERSION/Release"
-  curl -fsS -o /dev/null "$REPO_RELEASE" 2>/dev/null \
-    || c_die "MongoDB $MONGO_VERSION has no package for Ubuntu '$CODENAME' (checked $REPO_RELEASE). Try another version."
+  NEWEST=""
+  if [[ -z "$MONGO_VERSION" ]]; then
+    echo "Checking which MongoDB versions are published for Ubuntu $CODENAME ($DEB_ARCH)..."
+    NEWEST="$(newest_version)"
+    [[ -n "$NEWEST" ]] || c_die "MongoDB publishes no server package for Ubuntu '$CODENAME' ($DEB_ARCH) yet."
+  fi
+  ask MONGO_VERSION "MongoDB version" "$NEWEST"
+  [[ "$MONGO_VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || c_die "'$MONGO_VERSION' is not a version like 9.0."
+
+  # Check before changing anything (matters when a version is typed or passed with -m).
+  has_server_pkg "$MONGO_VERSION" \
+    || c_die "MongoDB $MONGO_VERSION has no server package for Ubuntu '$CODENAME' ($DEB_ARCH). Rerun and press Enter for the newest available version."
+
+  # Signing key: server-<version>.asc for older releases, server-<major>.asc for newer ones.
+  KEY_URL=""
+  for k in "server-$MONGO_VERSION.asc" "server-${MONGO_VERSION%%.*}.asc"; do
+    if curl -fsSL -o /dev/null "https://www.mongodb.org/static/pgp/$k" 2>/dev/null; then
+      KEY_URL="https://www.mongodb.org/static/pgp/$k"
+      break
+    fi
+  done
+  [[ -n "$KEY_URL" ]] || c_die "Could not find MongoDB's signing key for $MONGO_VERSION at https://www.mongodb.org/static/pgp/."
   ACTION="install MongoDB $MONGO_VERSION, create admin, enable auth, create app user"
 else
   if [[ "$AUTH_ON" == "true" ]]; then
@@ -206,7 +261,7 @@ if [[ -z "$INSTALLED_VERSION" ]]; then
   c_info "1/4  Installing MongoDB $MONGO_VERSION"
   apt_get update -y
   apt_get install -y gnupg curl openssl
-  curl -fsSL "https://www.mongodb.org/static/pgp/server-$MONGO_VERSION.asc" \
+  curl -fsSL "$KEY_URL" \
     | sudo gpg --dearmor --yes -o "/usr/share/keyrings/mongodb-server-$MONGO_VERSION.gpg"
   echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-$MONGO_VERSION.gpg ] https://repo.mongodb.org/apt/ubuntu $CODENAME/mongodb-org/$MONGO_VERSION multiverse" \
     | sudo tee "/etc/apt/sources.list.d/mongodb-org-$MONGO_VERSION.list" >/dev/null
