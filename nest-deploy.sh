@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# nest-deploy.sh - Deploy a NestJS app from Git into versioned release folders.
+# nest-deploy.sh - Deploy a NestJS app from Git into one app folder.
 #
 # Reads its settings from deploy.conf (written by server-setup.sh) in the base
 # folder. Layout:
 #
 #   /var/www/api.example.com/
 #     deploy.conf
-#     shared/.env               saved .env (chmod 600), copied into each release as .env
-#     release-1.1/
-#     release-1.2/
-#     current -> release-1.2    the release pm2 is running
+#     shared/.env               saved .env (chmod 600), copied into app/ as .env
+#     deploy.log                one line per deploy
+#     app/                      the code: git clone on the first deploy,
+#                               updated in place (pull, rebuild) after that
 #
 # The app gets PORT from deploy.conf as an env var (overrides PORT in .env), so
 # main.ts must listen on process.env.PORT.
@@ -20,10 +20,7 @@
 #   ENTRY="dist/main.js"        build output started in node mode (default)
 #
 # Usage:
-#   ./nest-deploy.sh --release 1.2     clone + fresh build into release-1.2, switch to it
-#   ./nest-deploy.sh                   update the live release in place (pull, delete dist, rebuild)
-#   ./nest-deploy.sh --rollback 1.1    switch back to an existing release
-#   ./nest-deploy.sh --list            show releases
+#   ./nest-deploy.sh                   clone (first time) or pull, install, delete dist, build, restart
 #   ./nest-deploy.sh --dir /srv/api    base folder, if it cannot be auto-detected
 #
 # Run on the server as the same user that ran server-setup.sh (root or a
@@ -31,11 +28,10 @@
 
 set -euo pipefail
 
-MODE="update"
-VERSION=""
 BASE=""
 
-# deploy.conf keys and their defaults.
+# deploy.conf keys and their defaults. KEEP_RELEASES is accepted but no longer
+# used (left over from the old release-folder layout).
 CONF_KEYS="DOMAIN PORT NODE_VERSION APP_NAME REPO_URL BRANCH KEEP_RELEASES START_MODE ENTRY"
 DOMAIN=""
 PORT=""
@@ -43,7 +39,7 @@ NODE_VERSION=""
 APP_NAME=""
 REPO_URL=""
 BRANCH="main"
-KEEP_RELEASES="5"
+KEEP_RELEASES=""
 START_MODE="node"
 ENTRY="dist/main.js"
 
@@ -73,37 +69,23 @@ ask() {
 # need OPTION VALUE - fail clearly when a flag is missing its value.
 need() { [[ -n "${2:-}" && "$2" != -* ]] || c_die "Option $1 needs a value (see --help)."; }
 
-set_mode() {
-  [[ "$MODE" == "update" ]] || c_die "Use only one of --release, --rollback, --list."
-  MODE="$1"
-}
-
 usage() {
   cat <<USAGE
 Usage: $0 [options]
-      --release VERSION    clone + fresh build into release-VERSION and switch to it
-      --rollback VERSION   switch back to the existing release-VERSION
-      --list               list releases
       --dir PATH           base folder containing deploy.conf
   -h, --help               show this help
-No option: update the live release in place (git pull, delete dist, rebuild).
+Clones the repo into app/ on the first deploy; after that pulls the latest
+commit, reinstalls, deletes dist, rebuilds and restarts the app.
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --release)  need "$1" "${2:-}"; set_mode "release";  VERSION="$2"; shift 2 ;;
-    --rollback) need "$1" "${2:-}"; set_mode "rollback"; VERSION="$2"; shift 2 ;;
-    --list)     set_mode "list"; shift ;;
     --dir)      need "$1" "${2:-}"; BASE="$2"; shift 2 ;;
     -h|--help)  usage; exit 0 ;;
-    *) c_die "Unknown option: $1" ;;
+    *) c_die "Unknown option: $1 (see --help)" ;;
   esac
 done
-
-if [[ -n "$VERSION" ]]; then
-  [[ "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || c_die "'$VERSION' is not a valid version (letters, digits, . _ -)."
-fi
 
 # ------------------------------------------------------------- deploy.conf ---
 load_conf() {
@@ -167,15 +149,13 @@ load_conf
 PORT=$((10#$PORT))
 [[ "$NODE_VERSION" =~ ^(v?[0-9]+(\.[0-9]+){0,2}|lts/.+|node)$ ]] || c_die "deploy.conf: NODE_VERSION '$NODE_VERSION' is not valid."
 [[ -n "$APP_NAME" ]] || APP_NAME="$DOMAIN"
-[[ "$KEEP_RELEASES" =~ ^[1-9][0-9]*$ ]] || c_die "deploy.conf: KEEP_RELEASES must be a number >= 1."
 [[ "$START_MODE" == "node" || "$START_MODE" == "script" ]] || c_die "deploy.conf: START_MODE must be \"node\" or \"script\"."
 [[ "$ENTRY" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]*\.c?js$ && "$ENTRY" != *..* ]] \
   || c_die "deploy.conf: ENTRY '$ENTRY' must be a relative .js path inside the project (e.g. dist/main.js)."
 
 SHARED="$BASE/shared"
 ENV_FILE="$SHARED/.env"
-LIVE="$(readlink -f "$BASE/current" 2>/dev/null || true)"
-[[ -d "$LIVE" ]] || LIVE=""
+APP_DIR="$BASE/app"
 
 # Only one deploy at a time per base folder.
 if command -v flock >/dev/null 2>&1; then
@@ -184,22 +164,6 @@ if command -v flock >/dev/null 2>&1; then
 fi
 
 # --------------------------------------------------------------- functions ---
-list_releases() {
-  local d name info
-  echo "Releases in $BASE (newest first):"
-  while IFS= read -r d; do
-    [[ -n "$d" ]] || continue
-    name="${d##*/release-}"
-    info=""
-    [[ -f "$d/.release-info" ]] && info="$(grep -E '^(commit|built)=' "$d/.release-info" | cut -d= -f2- | paste -sd' ' - || true)"
-    if [[ "$d" == "$LIVE" ]]; then
-      printf '  * %-15s %s  (live)\n' "$name" "$info"
-    else
-      printf '    %-15s %s\n' "$name" "$info"
-    fi
-  done < <(find "$BASE" -mindepth 1 -maxdepth 1 -type d -name 'release-*' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
-}
-
 load_node() {
   export NVM_DIR="$HOME/.nvm"
   [[ -s "$NVM_DIR/nvm.sh" ]] || c_die "nvm not found in $NVM_DIR - run server-setup.sh first."
@@ -305,6 +269,21 @@ env_step() {
   c_ok "saved $count variable(s) to $ENV_FILE"
 }
 
+# get_code - clone into app/ on the first deploy, otherwise fetch the latest commit.
+get_code() {
+  if [[ -d "$APP_DIR/.git" ]]; then
+    c_info "Pulling latest $BRANCH into $APP_DIR"
+    # Follow REPO_URL if it was changed in deploy.conf.
+    git -C "$APP_DIR" remote set-url origin "$REPO_URL"
+    git -C "$APP_DIR" fetch --depth 1 origin "$BRANCH" || c_die "git fetch failed - app untouched."
+    git -C "$APP_DIR" reset --hard FETCH_HEAD
+  else
+    c_info "Cloning $BRANCH into $APP_DIR"
+    git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$APP_DIR" || c_die "git clone failed."
+  fi
+  c_ok "code at commit $(git -C "$APP_DIR" rev-parse --short HEAD)"
+}
+
 # detect_pm DIR - sets PM and INSTALL from the lockfile in DIR.
 detect_pm() {
   local dir="$1"
@@ -344,19 +323,6 @@ build_in() {
   fi
 }
 
-write_info() {  # DIR VERSION
-  local commit
-  commit="$(git -C "$1" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  printf 'version=%s\nbranch=%s\ncommit=%s\nbuilt=%s\n' "$2" "$BRANCH" "$commit" "$(date '+%F %T')" > "$1/.release-info"
-}
-
-switch_current() {  # DIR - atomic symlink swap
-  ln -sfn "$1" "$BASE/current.tmp"
-  mv -Tf "$BASE/current.tmp" "$BASE/current"
-  LIVE="$1"
-  c_ok "current -> $(basename "$1")"
-}
-
 # start_app DIR - (re)start pm2 on DIR and wait for the app to answer.
 start_app() {
   local dir="$1" code="000" i
@@ -383,54 +349,30 @@ start_app() {
   return 1
 }
 
-prune_releases() {
-  local old
-  find "$BASE" -mindepth 1 -maxdepth 1 -type d -name 'release-*' -printf '%T@ %p\n' \
-    | sort -rn | tail -n +"$((KEEP_RELEASES + 1))" | cut -d' ' -f2- \
-    | while IFS= read -r old; do
-        [[ -n "$old" && "$old" != "$LIVE" ]] || continue
-        rm -rf -- "$old" && c_ok "removed old release $(basename "$old")"
-      done
-}
-
 log_deploy() {  # RESULT DETAIL
-  printf '%s  %-8s %-14s %s\n' "$(date '+%F %T')" "$MODE" "$1" "$2" >> "$BASE/deploy.log"
+  printf '%s  %-10s %s\n' "$(date '+%F %T')" "$1" "$2" >> "$BASE/deploy.log"
 }
 
 # ------------------------------------------------------------------- main ---
-if [[ "$MODE" == "list" ]]; then
-  list_releases
-  exit 0
+ensure_repo_url
+
+# Checked before anything changes: clone needs an empty (or missing) app/.
+if [[ ! -d "$APP_DIR/.git" && -e "$APP_DIR" ]] && [[ -n "$(ls -A "$APP_DIR" 2>/dev/null)" ]]; then
+  c_die "$APP_DIR exists but is not a git checkout - move it away, then rerun."
 fi
 
-case "$MODE" in
-  release)
-    TARGET="$BASE/release-$VERSION"
-    [[ -e "$TARGET" ]] && c_die "$TARGET already exists - pick a new version (see --list)."
-    ACTION="new release release-$VERSION (fresh clone + build)"
-    ensure_repo_url ;;
-  update)
-    [[ -n "$LIVE" ]] || c_die "No live release yet. First deploy: $0 --release 1.0"
-    TARGET="$LIVE"
-    ACTION="update $(basename "$LIVE") in place (site may error during the build)"
-    ensure_repo_url ;;
-  rollback)
-    TARGET="$BASE/release-$VERSION"
-    [[ -f "$TARGET/$ENTRY" ]] || c_die "release-$VERSION not found or never built (see --list)."
-    [[ "$TARGET" == "$LIVE" ]] && c_die "release-$VERSION is already live."
-    ACTION="roll back to release-$VERSION" ;;
-esac
-
-LIVE_NAME="(none)"
-[[ -n "$LIVE" ]] && LIVE_NAME="$(basename "$LIVE")"
+if [[ -d "$APP_DIR/.git" ]]; then
+  ACTION="update $APP_DIR in place (git pull, rebuild, restart - the API may error during the build)"
+else
+  ACTION="first deploy: clone into $APP_DIR, build, start"
+fi
 
 cat <<SUMMARY
 
 ------------------------------------------------------------
   Base        : $BASE
   Action      : $ACTION
-  Live now    : $LIVE_NAME
-  Repo        : ${REPO_URL:-(not needed)} ($BRANCH)
+  Repo        : $REPO_URL ($BRANCH)
   pm2 app     : $APP_NAME on port $PORT
   Node        : $NODE_VERSION
 ------------------------------------------------------------
@@ -444,68 +386,30 @@ esac
 
 load_node
 ensure_pm2
-PREV="$LIVE"
-
-if [[ "$MODE" == "rollback" ]]; then
-  switch_current "$TARGET"
-  if start_app "$TARGET"; then
-    log_deploy "ok" "release-$VERSION"
-    c_ok "rolled back to release-$VERSION"
-  else
-    log_deploy "start-fail" "release-$VERSION"
-    c_die "release-$VERSION did not start cleanly."
-  fi
-  exit 0
-fi
-
 git_auth
 env_step
+get_code
+COMMIT="$(git -C "$APP_DIR" rev-parse --short HEAD)"
 
-if [[ "$MODE" == "release" ]]; then
-  c_info "Cloning $BRANCH into $(basename "$TARGET")"
-  git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TARGET" || { rm -rf "$TARGET"; c_die "git clone failed."; }
-  if ! build_in "$TARGET"; then
-    rm -rf "$TARGET"
-    log_deploy "build-fail" "release-$VERSION"
-    c_die "Build failed - live site untouched, removed $(basename "$TARGET")."
-  fi
-  write_info "$TARGET" "$VERSION"
-  switch_current "$TARGET"
-  if start_app "$TARGET"; then
-    log_deploy "ok" "release-$VERSION $(git -C "$TARGET" rev-parse --short HEAD)"
-    prune_releases
-  else
-    log_deploy "start-fail" "release-$VERSION"
-    [[ -n "$PREV" ]] && c_warn "Roll back with: $0 --rollback ${PREV##*/release-}"
-    c_die "release-$VERSION is live but not answering."
-  fi
-else
-  c_info "Pulling latest $BRANCH into $(basename "$TARGET")"
-  cd "$TARGET"
-  git fetch --depth 1 origin "$BRANCH" || c_die "git fetch failed - live site untouched."
-  git reset --hard FETCH_HEAD
-  c_warn "Building in place - the site may show errors until the build finishes."
-  if ! build_in "$TARGET"; then
-    log_deploy "build-fail" "$(basename "$TARGET")"
-    c_die "Build failed - $(basename "$TARGET") is now broken. Fix and rerun, or: $0 --rollback <older version> (see --list)"
-  fi
-  write_info "$TARGET" "${TARGET##*/release-}"
-  if start_app "$TARGET"; then
-    log_deploy "ok" "$(basename "$TARGET") $(git -C "$TARGET" rev-parse --short HEAD)"
-  else
-    log_deploy "start-fail" "$(basename "$TARGET")"
-    c_die "$(basename "$TARGET") is not answering after the update."
-  fi
+if ! build_in "$APP_DIR"; then
+  log_deploy "build-fail" "$COMMIT"
+  c_die "Build failed at commit $COMMIT - fix it and rerun $0 (visitors see the maintenance page if the app is down)."
 fi
+
+if ! start_app "$APP_DIR"; then
+  log_deploy "start-fail" "$COMMIT"
+  c_die "The app is not answering on port $PORT - see: pm2 logs $APP_NAME"
+fi
+log_deploy "ok" "$COMMIT"
 
 cat <<DONE
 
 ============================================================
   DEPLOY COMPLETE
-  Live      : $(basename "$LIVE")  ($(git -C "$LIVE" rev-parse --short HEAD))
+  Commit    : $COMMIT ($BRANCH)
+  Code      : $APP_DIR
   Site      : https://$DOMAIN  (or http:// if SSL was skipped)
   Logs      : pm2 logs $APP_NAME
-  Releases  : $0 --list
   History   : $BASE/deploy.log
 ============================================================
 DONE

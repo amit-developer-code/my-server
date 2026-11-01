@@ -96,7 +96,7 @@ usage() {
 Usage: $0 [options]
   -d, --domain    DOMAIN     e.g. example.com
   -p, --port      PORT       app port nginx proxies to (default: $DEFAULT_PORT)
-  -a, --app-dir   PATH       base folder for releases + deploy.conf (default: /var/www/DOMAIN)
+  -a, --app-dir   PATH       base folder for deploy.conf + app/ (default: /var/www/DOMAIN)
   -e, --email     EMAIL      email for Let's Encrypt certificate
   -v, --node      VERSION    node version (default: $DEFAULT_NODE_VERSION)
   -r, --repo      URL        Git repo HTTPS URL (saved to deploy.conf)
@@ -156,7 +156,7 @@ if [[ -d /etc/nginx/sites-available ]]; then
   done
 fi
 
-ask APP_DIR "Base folder (releases + deploy.conf)" "/var/www/$DOMAIN"
+ask APP_DIR "Base folder (deploy.conf + app/)" "/var/www/$DOMAIN"
 [[ "$APP_DIR" == /* ]] || c_die "Base folder must be an absolute path (got '$APP_DIR')."
 APP_DIR="${APP_DIR%/}"
 
@@ -208,7 +208,7 @@ cat <<SUMMARY
 
 ------------------------------------------------------------
   Domain(s)   : ${DOMAINS[*]}
-  Base dir    : $APP_DIR (deploy.conf + release folders)
+  Base dir    : $APP_DIR (deploy.conf + app/)
   Fallback    : $FALLBACK_DIR/maintenance.html (copy of $PAGE_SRC)
   App port    : $PORT
   Node        : $NODE_VERSION (via nvm $NVM_VERSION)
@@ -283,7 +283,7 @@ fi
 
 # -------------------------------------------------------------- 4. folders ---
 c_info "4/7  Creating base folder, deploy.conf and fallback page"
-# The deploy script creates release-<version> folders and the current symlink here.
+# The deploy script clones the code into app/ here on the first deploy.
 sudo mkdir -p "$APP_DIR"
 sudo chown "$RUN_USER":"$RUN_GROUP" "$APP_DIR"
 sudo chmod 755 "$APP_DIR"
@@ -301,7 +301,6 @@ NODE_VERSION="$NODE_VERSION"
 APP_NAME="$DOMAIN"      # pm2 process name
 REPO_URL="$REPO_URL"    # HTTPS URL; asked on first deploy if empty
 BRANCH="$BRANCH"
-KEEP_RELEASES="5"       # older release-* folders are deleted after a new release
 EOF_CONF
   c_ok "wrote $CONF"
 fi
@@ -435,8 +434,8 @@ cat <<DONE
   Base dir  : $APP_DIR   (nginx proxies to port $PORT)
   Config    : $CONF
   Nginx     : sudo nginx -t && sudo systemctl reload nginx
-  NEXT      : ./deploy.sh --release 1.0        (Next.js)
-              ./nest-deploy.sh --release 1.0   (NestJS)
+  NEXT      : ./deploy.sh        (Next.js)
+              ./nest-deploy.sh   (NestJS)
   NOTE      : open a new shell (or run: source ~/.bashrc) to get node on PATH
 ============================================================
 DONE
